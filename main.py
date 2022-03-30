@@ -1,11 +1,13 @@
-import glob
 import hashlib
 import itertools
 import logging
 import os.path
+import sys
 from pathlib import Path
 
+import bs4
 import imagesize
+import requests
 import rich_click as click
 from PIL import Image
 from fpdf import FPDF
@@ -29,7 +31,12 @@ CONTENT_MAX_HEIGHT = (297. / 2) - 4
 CONTENT_RATIO = float(CONTENT_MAX_WIDTH) / CONTENT_MAX_HEIGHT
 
 
-@click.command()
+@click.group()
+def main():
+    pass
+
+
+@main.command()
 @click.argument('folder', type=click.Path(exists=True))
 @click.option('--out', '-o', default='out.pdf', type=click.Path())
 def place(folder, out):
@@ -40,9 +47,10 @@ def place(folder, out):
 
     images = tuple(sorted(itertools.chain(
         # TODO: insensitive
-        glob.glob1(folder, '*.png'),
-        glob.glob1(folder, '*.jpg'),
-        glob.glob1(folder, '*.jpeg'),
+        Path(folder).rglob('*.png'),
+        Path(folder).rglob('*.jpg'),
+        Path(folder).rglob('*.jpeg'),
+        Path(folder).rglob('*.JPG'),
     )))
 
     count = len(images)
@@ -50,26 +58,27 @@ def place(folder, out):
 
     pdf = FPDF()
 
-    for i, name in enumerate(images):
-        image_ext = Path(name).suffix
-        name_hash = hashlib.md5(name.encode()).hexdigest()
+    for i, path in enumerate(images):
+        image_ext = path.suffix
+        name_hash = hashlib.md5(path.as_posix().encode()).hexdigest()
         cached_path = (CACHE_FOLDER / name_hash).with_suffix(image_ext)
-        image_path = os.path.join(folder, name)
 
         is_top = i % 2 == 0
         if is_top:
             pdf.add_page()
             # A5 dimensions
             pdf.dashed_line(0, 148, 210, 148)
+            # 105 is half from 210, which is width of A4
+            # 148 is height of A5
             center = 105, (148 / 2)
         else:
             center = 105, 148 + (148 / 2)
 
         if not cached_path.exists():
-            logger.info(f'Resizing and caching {name}.')
-            im = Image.open(image_path)
+            logger.info(f'Resizing and caching {path}.')
+            im = Image.open(path)
             if im.width < im.height:
-                # all images will be lanscaped
+                # all images will be landscaped
                 im = im.rotate(90, expand=True)
             im.thumbnail(TARGET_SIZE, Image.ANTIALIAS)
             im.save(cached_path)
@@ -77,7 +86,7 @@ def place(folder, out):
         width, height = imagesize.get(cached_path)
         ratio = float(width) / height
 
-        logger.info(f'{i + 1}/{count} {name=} {width=} {height=} {ratio=}')
+        logger.info(f'{i + 1}/{count} {path=} {width=} {height=} {ratio=}')
 
         center_x, center_y = center
 
@@ -114,5 +123,58 @@ def place(folder, out):
               f'-sOutputFile={out} {out}.large')
 
 
+@main.command()
+@click.argument('folder', type=click.Path())
+@click.option('--urls-file',
+              type=click.File('r'),
+              default=sys.stdin)
+def download(folder: Path, urls_file):
+    """
+    Takes list of Google Photos urls from stdin (or --urls-file) and downloads them to specified folder.
+    Images are downloaded in resolution to match 300DPI on A5.
+    """
+    folder = Path(__file__).parent / Path(folder)
+    folder.mkdir(exist_ok=True)
+
+    sess = requests.Session()
+    with urls_file:
+        lines = urls_file.read().splitlines()
+
+    for url in lines:
+        logger.info(f'Processing {url}')
+        response = sess.get(url=url)
+        album_id = url.rpartition('/')[2]
+        (folder / album_id).mkdir(exist_ok=True)
+
+        page = bs4.BeautifulSoup(response.content, features="html.parser")
+
+        imgs = page.select('img')
+        logger.info(f'Found {len(imgs)} images')
+        for i, img in enumerate(imgs):
+            src = img.attrs.get('src')
+            if not src:
+                continue
+
+            if '/a/' in src:
+                # probably some page icons
+                continue
+
+            # 1748x2480
+            photo_id = hashlib.md5(src.encode()).hexdigest()
+
+            full_size_src = src.replace('w108', 'w2480').replace('h72', 'h1748').replace('s72', 's2480')
+
+            if full_size_src == src:
+                logger.error(f'Nope: {src}')
+                exit()
+
+            photo = sess.get(full_size_src)
+
+            with (folder / album_id / photo_id).with_suffix('.jpg').open('wb') as f:
+                f.write(photo.content)
+
+            logger.info(f'{i + 1}. photo saved.')
+
+
 if __name__ == "__main__":
-    place()
+    main()
